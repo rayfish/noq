@@ -1700,72 +1700,92 @@ impl ManyToManyRouting {
 
     fn route_client_to_server(&mut self, transmit: &Transmit) -> RoutingDecision {
         if let Some(client_interface_ip) = transmit.src_ip {
-            // If we have a client interface IP, then we use that to build the packet coming in on the other side.
-            // But we need to check if that is even connected to the server.
-            let Some(&(client_addr, _)) = self
-                .server_routes
-                .iter()
-                .filter(|(addr, _)| *addr == transmit.destination)
-                .filter_map(|&(_, idx)| self.client_routes.get(idx))
-                .find(|&(addr, _)| addr.ip() == client_interface_ip)
-            else {
+            // If we have a client interface IP, then the client needs to have such an
+            // interface and that interface needs to be connected to the server at the
+            // matching destination address.
+            if let Some((client_addr, _)) = self.client_routes.iter().find(|(addr, server_idx)| {
+                addr.ip() == client_interface_ip
+                    && self
+                        .server_routes
+                        .get(*server_idx)
+                        .is_some_and(|(server_addr, _)| *server_addr == transmit.destination)
+            }) {
+                RoutingDecision::Deliver {
+                    src: *client_addr,
+                    dst: Some(transmit.destination.ip()),
+                }
+            } else {
                 // There's no route for given four-tuple.
-                return RoutingDecision::Drop;
-            };
-            RoutingDecision::Deliver {
-                src: client_addr,
-                dst: Some(transmit.destination.ip()),
+                RoutingDecision::Drop
             }
         } else {
-            let Some((_, client_addr_idx)) = self
+            // Find the index of the server's interface matching the destination address,
+            // then find the first client interface that can send to this address.
+            if let Some(client_addr) = self
                 .server_routes
                 .iter()
-                .find(|(addr, _)| *addr == transmit.destination)
-            else {
-                return RoutingDecision::Drop;
-            };
-            let Some((client_addr, _)) = self.client_routes.get(*client_addr_idx) else {
-                return RoutingDecision::Drop;
-            };
-            RoutingDecision::Deliver {
-                src: *client_addr,
-                dst: Some(transmit.destination.ip()),
+                .enumerate()
+                .find(|(_, (addr, _))| *addr == transmit.destination)
+                .and_then(|(server_idx, _)| {
+                    // Find a client interface that routes to this server_idx.
+                    self.client_routes
+                        .iter()
+                        .find(|(_, dst_idx)| *dst_idx == server_idx)
+                        .map(|(client_addr, _)| client_addr)
+                })
+            {
+                RoutingDecision::Deliver {
+                    src: *client_addr,
+                    dst: Some(transmit.destination.ip()),
+                }
+            } else {
+                RoutingDecision::Drop
             }
         }
     }
 
     fn route_server_to_client(&mut self, transmit: &Transmit) -> RoutingDecision {
         if let Some(server_interface_ip) = transmit.src_ip {
-            // If we have a server interface IP, then we use that to build the packet coming in on the other side.
-            // But we need to check if that is even connected to the client.
-            let Some(&(server_addr, _)) = self
-                .client_routes
-                .iter()
-                .filter(|(addr, _)| *addr == transmit.destination)
-                .filter_map(|&(_, idx)| self.server_routes.get(idx))
-                .find(|&(addr, _)| addr.ip() == server_interface_ip)
-            else {
+            // If we have a server interface IP, then the server needs to have such an
+            // interface and that interface needs to be connected to the client at the
+            // matching destination address.
+            if let Some((server_addr, _)) = self.server_routes.iter().find(|(addr, client_idx)| {
+                addr.ip() == server_interface_ip
+                    && self
+                        .client_routes
+                        .get(*client_idx)
+                        .is_some_and(|(client_addr, _)| *client_addr == transmit.destination)
+            }) {
+                RoutingDecision::Deliver {
+                    src: *server_addr,
+                    dst: Some(transmit.destination.ip()),
+                }
+            } else {
                 // There's no route for given four-tuple.
-                return RoutingDecision::Drop;
-            };
-            RoutingDecision::Deliver {
-                src: server_addr,
-                dst: Some(transmit.destination.ip()),
+                RoutingDecision::Drop
             }
         } else {
-            let Some((_, server_addr_idx)) = self
+            // Find the index of the client's interface matching the destination address,
+            // then find the first server interface that can send to this address.
+            if let Some(server_addr) = self
                 .client_routes
                 .iter()
-                .find(|(addr, _)| *addr == transmit.destination)
-            else {
-                return RoutingDecision::Drop;
-            };
-            let Some((server_addr, _)) = self.server_routes.get(*server_addr_idx) else {
-                return RoutingDecision::Drop;
-            };
-            RoutingDecision::Deliver {
-                src: *server_addr,
-                dst: Some(transmit.destination.ip()),
+                .enumerate()
+                .find(|(_, (addr, _))| *addr == transmit.destination)
+                .and_then(|(client_idx, _)| {
+                    // Find a client interface that routes to this server_idx.
+                    self.server_routes
+                        .iter()
+                        .find(|(_, dst_idx)| *dst_idx == client_idx)
+                        .map(|(server_addr, _)| server_addr)
+                })
+            {
+                RoutingDecision::Deliver {
+                    src: *server_addr,
+                    dst: Some(transmit.destination.ip()),
+                }
+            } else {
+                RoutingDecision::Drop
             }
         }
     }
