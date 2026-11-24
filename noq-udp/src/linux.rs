@@ -13,6 +13,9 @@ pub(super) mod gso {
         major_revision: 18,
     };
 
+    /// Maximum number of datagrams we submit in a Linux UDP GSO batch.
+    pub(crate) const MAX_SEGMENTS: usize = 64;
+
     /// Checks whether GSO support is available.
     ///
     /// Checks the kernel version followed by setting the UDP_SEGMENT option on a socket.
@@ -33,7 +36,7 @@ pub(super) mod gso {
                 // - https://man7.org/linux/man-pages/man7/udp.7.html
                 let _ = set_socket_option(socket, libc::SOL_UDP, libc::UDP_SEGMENT, 0);
 
-                64
+                MAX_SEGMENTS
             }
             Err(_e) => {
                 crate::log::debug!(

@@ -207,7 +207,32 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
+        let result = send(self, SockRef::from(&*socket.0), transmit);
+        #[cfg(target_os = "linux")]
+        let result = match result {
+            Err(ref err) if matches!(err.raw_os_error(), Some(libc::EIO | libc::EINVAL)) => {
+                match transmit
+                    .effective_segment_size()
+                    .and_then(NonZeroUsize::new)
+                {
+                    Some(size)
+                        if transmit.contents.len().div_ceil(size.get()) <= gso::MAX_SEGMENTS =>
+                    {
+                        send_segments(transmit.contents, size, |contents| {
+                            let datagram = Transmit {
+                                contents,
+                                segment_size: None,
+                                ..*transmit
+                            };
+                            send(self, SockRef::from(&*socket.0), &datagram)
+                        })
+                    }
+                    _ => result,
+                }
+            }
+            _ => result,
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid these by
@@ -857,6 +882,24 @@ type IpTosTy = libc::c_uchar;
 #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
 pub(crate) type IpTosTy = libc::c_int;
 
+/// A rejected sendmsg accepted no datagrams. Retry each segment, including the short tail.
+#[cfg(target_os = "linux")]
+fn send_segments(
+    contents: &[u8],
+    size: NonZeroUsize,
+    mut send_one: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    for (index, datagram) in contents.chunks(size.get()).enumerate() {
+        match send_one(datagram) {
+            // Once a prefix is on the wire, returning WouldBlock would replay it.
+            // The best-effort send API treats the unsent suffix as lost.
+            Err(err) if index > 0 && err.kind() == io::ErrorKind::WouldBlock => break,
+            result => result?,
+        }
+    }
+    Ok(())
+}
+
 /// Returns whether the given socket option is supported on the current platform
 ///
 /// Yields `Ok(true)` if the option was set successfully, `Ok(false)` if setting
@@ -912,5 +955,67 @@ pub(crate) fn retry_if_interrupted(mut f: impl FnMut() -> isize) -> io::Result<i
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gso_fallback_tests {
+    use super::*;
+    use std::{net::UdpSocket, time::Duration};
+
+    #[test]
+    fn refused_gso_batch_delivers_each_datagram() {
+        let tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let state = UdpSocketState::new((&tx).into()).unwrap();
+        if state.max_gso_segments() == NonZeroUsize::MIN {
+            return;
+        }
+        // Linux requires a UDP checksum for segmented sends.
+        set_socket_option(&tx, libc::SOL_SOCKET, libc::SO_NO_CHECK, 1).unwrap();
+        let transmit = Transmit {
+            destination: rx.local_addr().unwrap(),
+            src_ip: Some(tx.local_addr().unwrap().ip()),
+            ecn: None,
+            contents: b"abcdefgh",
+            segment_size: Some(3),
+        };
+        state.send((&tx).into(), &transmit).unwrap();
+        assert_eq!(state.max_gso_segments(), NonZeroUsize::MIN);
+        for expected in transmit.contents.chunks(3) {
+            let mut buf = [0; 16];
+            let (len, source) = rx.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..len], expected);
+            assert_eq!(source, tx.local_addr().unwrap());
+        }
+        rx.set_nonblocking(true).unwrap();
+        assert_eq!(
+            rx.recv(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn would_block_retries_only_an_entirely_unsent_batch() {
+        let size = NonZeroUsize::MIN;
+        let blocked = io::ErrorKind::WouldBlock;
+        assert_eq!(
+            send_segments(b"abc", size, |_| Err(blocked.into()))
+                .unwrap_err()
+                .kind(),
+            blocked
+        );
+        let mut attempted = Vec::new();
+        send_segments(b"abc", size, |part| {
+            attempted.extend_from_slice(part);
+            if part == b"b" {
+                Err(blocked.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempted, b"ab");
     }
 }
